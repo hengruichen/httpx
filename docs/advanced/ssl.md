@@ -118,8 +118,8 @@ Or two-tuple of (certificate file, key file)...
 
 ```pycon
 >>> cert = ("path/to/client.pem", "path/to/client.key")
->>> ssl_context = httpx.SSLContext(cert=cert)
->>> httpx.get("https://example.org", ssl_context=ssl_context)
+# ... [truncated] ...
+_context=ssl_context)
 <Response [200 OK]>
 ```
 
@@ -235,4 +235,5 @@ If you do need to make HTTPS connections to a local server, for example to test 
 >>> r
 Response <200 OK>
 ```
+
 
