@@ -40,7 +40,7 @@ If you're using a `Client()` instance, then you should pass any SSL settings whe
 
 The `client.get(...)` method and other request methods on a `Client` instance *do not* support changing the SSL settings on a per-request basis.
 
-If you need different SSL settings in different cases you should use more that one client instance, with different settings on each. Each client will then be using an isolated connection pool with a specific fixed SSL configuration on all connections within that pool.
+If you need different SSL settings in different cases you should use more than one client instance, with different settings on each. Each client will then be using an isolated connection pool with a specific fixed SSL configuration on all connections within that pool.
 
 ### Changing the verification defaults
 
@@ -101,7 +101,7 @@ Or by providing an certificate directory:
 <Response [200 OK]>
 ```
 
-These usages are equivelent to using [`.load_verify_locations()`](https://docs.python.org/3/library/ssl.html#ssl.SSLContext.load_verify_locations) with either `cafile=...` or `capath=...`.
+These usages are equivalent to using [`.load_verify_locations()`](https://docs.python.org/3/library/ssl.html#ssl.SSLContext.load_verify_locations) with either `cafile=...` or `capath=...`.
 
 ### Client side certificates
 
@@ -118,8 +118,8 @@ Or two-tuple of (certificate file, key file)...
 
 ```pycon
 >>> cert = ("path/to/client.pem", "path/to/client.key")
->>> ssl_context = httpx.SSLContext(cert=cert)
->>> httpx.get("https://example.org", ssl_context=ssl_context)
+# ... [truncated] ...
+_context=ssl_context)
 <Response [200 OK]>
 ```
 
@@ -173,7 +173,7 @@ ssl_context = httpx.SSLContext(verify=verify)
 
 ### Working with `SSLKEYLOGFILE`
 
-This environment variable is used for [inspecing and debugging SSL](https://everything.curl.dev/usingcurl/tls/sslkeylogfile).
+This environment variable is used for [inspecting and debugging SSL](https://everything.curl.dev/usingcurl/tls/sslkeylogfile).
 
 Unlike `requests` or the standard library [`ssl.create_default_context`](https://docs.python.org/3/library/ssl.html#ssl.create_default_context) the `httpx` package does not automatically configure an SSL context to use `SSLKEYLOGFILE`. If you want to use this it needs to be configured explicitly.
 
@@ -235,4 +235,5 @@ If you do need to make HTTPS connections to a local server, for example to test 
 >>> r
 Response <200 OK>
 ```
+
 
