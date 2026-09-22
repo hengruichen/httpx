@@ -146,151 +146,63 @@ class SSLConfig:
         except AttributeError:  # pragma: no cover
             pass
 
-        if ca_bundle_path.is_file():
-            cafile = str(ca_bundle_path)
-            logger.debug("load_verify_locations cafile=%r", cafile)
-            context.load_verify_locations(cafile=cafile)
-        elif ca_bundle_path.is_dir():
-            capath = str(ca_bundle_path)
-            logger.debug("load_verify_locations capath=%r", capath)
-            context.load_verify_locations(capath=capath)
+        # Load the CA certificate bundle.
+        try:
+            context.load_verify_locations(ca_bundle_path)
+        except OSError as exc:
+            raise IOError(
+                "Could not load the TLS CA certificate bundle: {}".format(
+                    ca_bundle_path
+                )
+            ) from exc
 
         self._load_client_certs(context)
-
         return context
 
     def _create_default_ssl_context(self) -> ssl.SSLContext:
-        """
-        Creates the default SSLContext object that's used for both verified
-        and unverified connections.
-        """
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         set_minimum_tls_version_1_2(context)
-        context.options |= ssl.OP_NO_COMPRESSION
         context.set_ciphers(DEFAULT_CIPHERS)
-
-        if ssl.HAS_ALPN:
-            alpn_idents = ["http/1.1", "h2"] if self.http2 else ["http/1.1"]
-            context.set_alpn_protocols(alpn_idents)
-
-        keylogfile = os.environ.get("SSLKEYLOGFILE")
-        if keylogfile and self.trust_env:
-            context.keylog_filename = keylogfile
-
         return context
 
-    def _load_client_certs(self, ssl_context: ssl.SSLContext) -> None:
-        """
-        Loads client certificates into our SSLContext object
-        """
-        if self.cert is not None:
-            if isinstance(self.cert, str):
-                ssl_context.load_cert_chain(certfile=self.cert)
-            elif isinstance(self.cert, tuple) and len(self.cert) == 2:
-                ssl_context.load_cert_chain(certfile=self.cert[0], keyfile=self.cert[1])
-            elif isinstance(self.cert, tuple) and len(self.cert) == 3:
-                ssl_context.load_cert_chain(
-                    certfile=self.cert[0],
-                    keyfile=self.cert[1],
-                    password=self.cert[2],
-                )
-
-
-class Timeout:
-    """
-    Timeout configuration.
-
-    **Usage**:
-
-    Timeout(None)               # No timeouts.
-    Timeout(5.0)                # 5s timeout on all operations.
-    Timeout(None, connect=5.0)  # 5s timeout on connect, no other timeouts.
-    Timeout(5.0, connect=10.0)  # 10s timeout on connect. 5s timeout elsewhere.
-    Timeout(5.0, pool=None)     # No timeout on acquiring connection from pool.
-                                # 5s timeout elsewhere.
-    """
-
-    def __init__(
-        self,
-        timeout: typing.Union[TimeoutTypes, UnsetType] = UNSET,
-        *,
-        connect: typing.Union[None, float, UnsetType] = UNSET,
-        read: typing.Union[None, float, UnsetType] = UNSET,
-        write: typing.Union[None, float, UnsetType] = UNSET,
-        pool: typing.Union[None, float, UnsetType] = UNSET,
-    ) -> None:
-        if isinstance(timeout, Timeout):
-            # Passed as a single explicit Timeout.
-            assert connect is UNSET
-            assert read is UNSET
-            assert write is UNSET
-            assert pool is UNSET
-            self.connect = timeout.connect  # type: typing.Optional[float]
-            self.read = timeout.read  # type: typing.Optional[float]
-            self.write = timeout.write  # type: typing.Optional[float]
-            self.pool = timeout.pool  # type: typing.Optional[float]
-        elif isinstance(timeout, tuple):
-            # Passed as a tuple.
-            self.connect = timeout[0]
-            self.read = timeout[1]
-            self.write = None if len(timeout) < 3 else timeout[2]
-            self.pool = None if len(timeout) < 4 else timeout[3]
-        elif not (
-            isinstance(connect, UnsetType)
-            or isinstance(read, UnsetType)
-            or isinstance(write, UnsetType)
-            or isinstance(pool, UnsetType)
-        ):
-            self.connect = connect
-            self.read = read
-            self.write = write
-            self.pool = pool
-        else:
-            if isinstance(timeout, UnsetType):
-                raise ValueError(
-                    "httpx.Timeout must either include a default, or set all "
-                    "four parameters explicitly."
-                )
-            self.connect = timeout if isinstance(connect, UnsetType) else connect
-            self.read = timeout if isinstance(read, UnsetType) else read
-            self.write = timeout if isinstance(write, UnsetType) else write
-            self.pool = timeout if isinstance(pool, UnsetType) else pool
-
-    def as_dict(self) -> typing.Dict[str, typing.Optional[float]]:
-        return {
-            "connect": self.connect,
-            "read": self.read,
-            "write": self.write,
-            "pool": self.pool,
-        }
+    def _load_client_certs(self, context: ssl.SSLContext) -> None:
+        cert_path = self.cert
+        if cert_path is not None:
+            if isinstance(cert_path, (list, tuple)):
+                for cert in cert_path:
+                    if isinstance(cert, (list, tuple)):
+                        cert, key = cert
+                    else:
+                        key = None
+                    context.load_cert_chain(cert, key)
+            else:
+                context.load_cert_chain(cert_path)
 
     def __eq__(self, other: typing.Any) -> bool:
         return (
             isinstance(other, self.__class__)
-            and self.connect == other.connect
-            and self.read == other.read
-            and self.write == other.write
-            and self.pool == other.pool
+            and self.cert == other.cert
+            and self.verify == other.verify
+            and self.trust_env == other.trust_env
+            and self.http2 == other.http2
         )
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
-        if len({self.connect, self.read, self.write, self.pool}) == 1:
-            return f"{class_name}(timeout={self.connect})"
         return (
-            f"{class_name}(connect={self.connect}, "
-            f"read={self.read}, write={self.write}, pool={self.pool})"
+            f"{class_name}(cert={self.cert!r}, "
+            f"verify={self.verify!r}, "
+            f"trust_env={self.trust_env!r}, "
+            f"http2={self.http2!r})"
         )
 
 
 class Limits:
     """
-    Configuration for limits to various client behaviors.
+    Connection pool limits.
 
-    **Parameters:**
-
-    * **max_connections** - The maximum number of concurrent connections that may be
-            established.
+    * **max_connections** - The maximum number of concurrent connections that
+            can be established to any given host. Defaults to 100.
     * **max_keepalive_connections** - Allow the connection pool to maintain
             keep-alive connections below this point. Should be less than or equal
             to `max_connections`.
@@ -404,3 +316,4 @@ DEFAULT_TIMEOUT_CONFIG = Timeout(timeout=5.0)
 DEFAULT_LIMITS = Limits(max_connections=100, max_keepalive_connections=20)
 DEFAULT_NETWORK_OPTIONS = NetworkOptions(connection_retries=0)
 DEFAULT_MAX_REDIRECTS = 20
+
