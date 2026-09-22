@@ -148,1140 +148,225 @@ class BoundAsyncStream(AsyncByteStream):
             yield chunk
 
     async def aclose(self) -> None:
-        seconds = await self._timer.async_elapsed()
+        seconds = self._timer.async_elapsed()
         self._response.elapsed = datetime.timedelta(seconds=seconds)
         await self._stream.aclose()
 
 
-EventHook = typing.Callable[..., typing.Any]
+class Client:
+    """
+    An HTTP client.
 
+    **Parameters:**
 
-class BaseClient:
+    - **base_url** -- An optional base URL to use for all requests sent from
+      this client instance. If provided, all requests will be assumed to be
+      relative to this URL, and will have this URL prepended to them before
+      sending.
+    - **transport** -- An optional transport implementation to use for sending
+      HTTP requests. Defaults to `httpx.HTTPTransport`.
+    - **limits** -- An optional `Limits` instance to use for configuring
+      connection limits on the underlying transport.
+    - **follow_redirects** -- An optional boolean indicating whether redirects
+      should be automatically followed. Defaults to `False`.
+    - **auth** -- An optional `Auth` instance to use for authenticating
+      requests. May also be provided as a callable, string, or tuple.
+    - **proxy** -- An optional `Proxy` instance to use for configuring
+      proxies. May also be provided as a string.
+    - **timeout** -- An optional `Timeout` instance to use for configuring
+      timeouts on requests.
+    - **verify** -- An optional `VerifyTypes` value to use for configuring
+      TLS verification.
+    - **cert** -- An optional `CertTypes` value to use for configuring TLS
+      client certificates.
+    - **http2** -- An optional boolean indicating whether HTTP/2 should be
+      enabled. Defaults to `True`.
+    - **http2_prior_knowledge** -- An optional boolean indicating whether to
+      enable HTTP/2 without HTTP/1.1 Upgrade. Defaults to `False`.
+    - **max_redirects** -- An optional integer indicating the maximum number of
+      redirects to follow. Defaults to `DEFAULT_MAX_REDIRECTS`.
+    - **dispatch** -- An optional `Dispatch` instance to use for configuring
+      request routing.
+    - **event_hooks** -- An optional `EventHooks` to use for configuring event
+      hooks.
+    - **extensions** -- An optional `Extensions` to use for configuring
+      extensions.
+    """
+
     def __init__(
         self,
         *,
+        base_url: typing.Optional[URLTypes] = None,
+        transport: typing.Optional[BaseTransport] = None,
+        limits: typing.Optional[Limits] = None,
+        follow_redirects: typing.Optional[bool] = None,
         auth: typing.Optional[AuthTypes] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        persistent_cookies: bool = False,
-        timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
-        follow_redirects: bool = False,
-        max_redirects: int = DEFAULT_MAX_REDIRECTS,
-        event_hooks: typing.Optional[
-            typing.Mapping[str, typing.List[EventHook]]
-        ] = None,
-        base_url: URLTypes = "",
-        trust_env: bool = True,
-        default_encoding: typing.Union[str, typing.Callable[[bytes], str]] = "utf-8",
+        proxy: typing.Optional[ProxyTypes] = None,
+        timeout: typing.Optional[TimeoutTypes] = None,
+        verify: typing.Optional[VerifyTypes] = None,
+        cert: typing.Optional[CertTypes] = None,
+        http2: typing.Optional[bool] = None,
+        http2_prior_knowledge: typing.Optional[bool] = None,
+        max_redirects: typing.Optional[int] = None,
+        dispatch: typing.Optional["Dispatch"] = None,
+        event_hooks: typing.Optional[EventHooks] = None,
+        extensions: typing.Optional[Extensions] = None,
     ) -> None:
-        event_hooks = {} if event_hooks is None else event_hooks
+        if dispatch is None:
+            from ._dispatch import Dispatcher
 
-        self._base_url = self._enforce_trailing_slash(URL(base_url))
+            dispatch = Dispatcher()
 
-        self._auth = self._build_auth(auth)
-        self._params = QueryParams(params)
-        self.headers = Headers(headers)
-        self._cookies = Cookies(cookies)
-        self._persistent_cookies = persistent_cookies
-        self._timeout = Timeout(timeout)
-        self.follow_redirects = follow_redirects
-        self.max_redirects = max_redirects
-        self._event_hooks = {
-            "request": list(event_hooks.get("request", [])),
-            "response": list(event_hooks.get("response", [])),
-        }
-        self._trust_env = trust_env
-        self._default_encoding = default_encoding
+        if event_hooks is None:
+            from ._events import Events
+
+            event_hooks = Events()
+
+        if extensions is None:
+            from ._extensions import Extensions
+
+            extensions = Extensions()
+
+        if max_redirects is None:
+            max_redirects = DEFAULT_MAX_REDIRECTS
+
+        if http2 is None:
+            http2 = True
+
+        if http2_prior_knowledge is None:
+            http2_prior_knowledge = False
+
+        if timeout is None:
+            timeout = DEFAULT_TIMEOUT_CONFIG
+
+        if limits is None:
+            limits = DEFAULT_LIMITS
+
         self._state = ClientState.UNOPENED
+        self._base_url = URL(base_url) if base_url is not None else None
+        self._transport = transport
+        self._limits = limits
+        self._follow_redirects = follow_redirects
+        self._auth = auth
+        self._proxy = proxy
+        self._timeout = timeout
+        self._verify = verify
+        self._cert = cert
+        self._http2 = http2
+        self._http2_prior_knowledge = http2_prior_knowledge
+        self._max_redirects = max_redirects
+        self._dispatch = dispatch
+        self._event_hooks = event_hooks
+        self._extensions = extensions
+
+        self._mounts = {}
 
     @property
-    def is_closed(self) -> bool:
+    def base_url(self) -> typing.Optional[URL]:
         """
-        Check if the client being closed
+        The base URL for the client.
         """
-        return self._state == ClientState.CLOSED
+        return self._base_url
 
     @property
-    def trust_env(self) -> bool:
-        return self._trust_env
-
-    def _enforce_trailing_slash(self, url: URL) -> URL:
-        if url.raw_path.endswith(b"/"):
-            return url
-        return url.copy_with(raw_path=url.raw_path + b"/")
-
-    def _get_proxy_map(
-        self, proxies: typing.Optional[ProxiesTypes], allow_env_proxies: bool
-    ) -> typing.Dict[str, typing.Optional[Proxy]]:
-        if proxies is None:
-            if allow_env_proxies:
-                return {
-                    key: None if url is None else Proxy(url=url)
-                    for key, url in get_environment_proxies().items()
-                }
-            return {}
-        if isinstance(proxies, dict):
-            new_proxies = {}
-            for key, value in proxies.items():
-                proxy = Proxy(url=value) if isinstance(value, (str, URL)) else value
-                new_proxies[str(key)] = proxy
-            return new_proxies
-        else:
-            proxy = Proxy(url=proxies) if isinstance(proxies, (str, URL)) else proxies
-            return {"all://": proxy}
+    def transport(self) -> BaseTransport:
+        """
+        The underlying transport instance.
+        """
+        return self._transport
 
     @property
-    def timeout(self) -> Timeout:
-        return self._timeout
-
-    @timeout.setter
-    def timeout(self, timeout: TimeoutTypes) -> None:
-        self._timeout = Timeout(timeout)
+    def limits(self) -> Limits:
+        """
+        The connection limits configured on the client.
+        """
+        return self._limits
 
     @property
-    def event_hooks(self) -> typing.Dict[str, typing.List[EventHook]]:
-        return self._event_hooks
-
-    @event_hooks.setter
-    def event_hooks(
-        self, event_hooks: typing.Dict[str, typing.List[EventHook]]
-    ) -> None:
-        self._event_hooks = {
-            "request": list(event_hooks.get("request", [])),
-            "response": list(event_hooks.get("response", [])),
-        }
+    def follow_redirects(self) -> bool:
+        """
+        Whether redirects are automatically followed.
+        """
+        return self._follow_redirects
 
     @property
     def auth(self) -> typing.Optional[Auth]:
         """
-        Authentication class used when none is passed at the request-level.
-
-        See also [Authentication][0].
-
-        [0]: /quickstart/#authentication
+        The configured auth instance.
         """
         return self._auth
 
-    @auth.setter
-    def auth(self, auth: AuthTypes) -> None:
-        self._auth = self._build_auth(auth)
+    @property
+    def proxy(self) -> typing.Optional[Proxy]:
+        """
+        The configured proxy instance.
+        """
+        return self._proxy
 
     @property
-    def base_url(self) -> URL:
+    def timeout(self) -> Timeout:
         """
-        Base URL to use when sending requests with relative URLs.
+        The configured timeout instance.
         """
-        return self._base_url
-
-    @base_url.setter
-    def base_url(self, url: URLTypes) -> None:
-        self._base_url = self._enforce_trailing_slash(URL(url))
+        return self._timeout
 
     @property
-    def headers(self) -> Headers:
+    def verify(self) -> VerifyTypes:
         """
-        HTTP headers to include when sending requests.
+        The configured TLS verification value.
         """
-        return self._headers
-
-    @headers.setter
-    def headers(self, headers: HeaderTypes) -> None:
-        client_headers = Headers(
-            {
-                b"Accept": b"*/*",
-                b"Accept-Encoding": ACCEPT_ENCODING.encode("ascii"),
-                b"Connection": b"keep-alive",
-                b"User-Agent": USER_AGENT.encode("ascii"),
-            }
-        )
-        client_headers.update(headers)
-        self._headers = client_headers
+        return self._verify
 
     @property
-    def cookies(self) -> Cookies:
+    def cert(self) -> CertTypes:
         """
-        Cookie values to include when sending requests.
+        The configured TLS certificate value.
         """
-        return self._cookies
-
-    @cookies.setter
-    def cookies(self, cookies: CookieTypes) -> None:
-        self._cookies = Cookies(cookies)
+        return self._cert
 
     @property
-    def params(self) -> QueryParams:
+    def http2(self) -> bool:
         """
-        Query parameters to include in the URL when sending requests.
+        Whether HTTP/2 is enabled.
         """
-        return self._params
+        return self._http2
 
-    @params.setter
-    def params(self, params: QueryParamTypes) -> None:
-        self._params = QueryParams(params)
-
-    def build_request(
-        self,
-        method: str,
-        url: URLTypes,
-        *,
-        content: typing.Optional[RequestContent] = None,
-        data: typing.Optional[RequestData] = None,
-        files: typing.Optional[RequestFiles] = None,
-        json: typing.Optional[typing.Any] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Request:
+    @property
+    def http2_prior_knowledge(self) -> bool:
         """
-        Build and return a request instance.
-
-        * The `params`, `headers` and `cookies` arguments
-        are merged with any values set on the client.
-        * The `url` argument is merged with any `base_url` set on the client.
-
-        See also: [Request instances][0]
-
-        [0]: /advanced/#request-instances
+        Whether HTTP/2 is enabled without HTTP/1.1 Upgrade.
         """
-        url = self._merge_url(url)
-        headers = self._merge_headers(headers)
-        cookies = self._merge_cookies(cookies)
-        params = self._merge_queryparams(params)
-        extensions = {} if extensions is None else extensions
-        if "timeout" not in extensions:
-            timeout = (
-                self.timeout
-                if isinstance(timeout, UseClientDefault)
-                else Timeout(timeout)
-            )
-            extensions = dict(**extensions, timeout=timeout.as_dict())
-        return Request(
-            method,
-            url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            extensions=extensions,
-        )
+        return self._http2_prior_knowledge
 
-    def _merge_url(self, url: URLTypes) -> URL:
+    @property
+    def max_redirects(self) -> int:
         """
-        Merge a URL argument together with any 'base_url' on the client,
-        to create the URL used for the outgoing request.
+        The configured maximum number of redirects.
         """
-        merge_url = URL(url)
-        if merge_url.is_relative_url:
-            # To merge URLs we always append to the base URL. To get this
-            # behaviour correct we always ensure the base URL ends in a '/'
-            # separator, and strip any leading '/' from the merge URL.
-            #
-            # So, eg...
-            #
-            # >>> client = Client(base_url="https://www.example.com/subpath")
-            # >>> client.base_url
-            # URL('https://www.example.com/subpath/')
-            # >>> client.build_request("GET", "/path").url
-            # URL('https://www.example.com/subpath/path')
-            merge_raw_path = self.base_url.raw_path + merge_url.raw_path.lstrip(b"/")
-            return self.base_url.copy_with(raw_path=merge_raw_path)
-        return merge_url
+        return self._max_redirects
 
-    def _merge_cookies(
-        self, cookies: typing.Optional[CookieTypes] = None
-    ) -> typing.Optional[CookieTypes]:
+    @property
+    def dispatch(self) -> "Dispatch":
         """
-        Merge a cookies argument together with any cookies on the client,
-        to create the cookies used for the outgoing request.
+        The configured dispatch instance.
         """
-        if cookies or self.cookies:
-            merged_cookies = Cookies(self.cookies)
-            merged_cookies.update(cookies)
-            return merged_cookies
-        return cookies
+        return self._dispatch
 
-    def _merge_headers(
-        self, headers: typing.Optional[HeaderTypes] = None
-    ) -> typing.Optional[HeaderTypes]:
+    @property
+    def event_hooks(self) -> EventHooks:
         """
-        Merge a headers argument together with any headers on the client,
-        to create the headers used for the outgoing request.
+        The configured event hooks.
         """
-        merged_headers = Headers(self.headers)
-        merged_headers.update(headers)
-        return merged_headers
+        return self._event_hooks
 
-    def _merge_queryparams(
-        self, params: typing.Optional[QueryParamTypes] = None
-    ) -> typing.Optional[QueryParamTypes]:
+    @property
+    def extensions(self) -> Extensions:
         """
-        Merge a queryparams argument together with any queryparams on the client,
-        to create the queryparams used for the outgoing request.
+        The configured extensions.
         """
-        if params or self.params:
-            merged_queryparams = QueryParams(self.params)
-            return merged_queryparams.merge(params)
-        return params
+        return self._extensions
 
-    def _build_auth(self, auth: typing.Optional[AuthTypes]) -> typing.Optional[Auth]:
-        if auth is None:
-            return None
-        elif isinstance(auth, tuple):
-            return BasicAuth(username=auth[0], password=auth[1])
-        elif isinstance(auth, Auth):
-            return auth
-        elif callable(auth):
-            return FunctionAuth(func=auth)
-        else:
-            raise TypeError(f'Invalid "auth" argument: {auth!r}')
-
-    def _build_request_auth(
-        self,
-        request: Request,
-        auth: typing.Union[AuthTypes, UseClientDefault, None] = USE_CLIENT_DEFAULT,
-    ) -> Auth:
-        auth = (
-            self._auth if isinstance(auth, UseClientDefault) else self._build_auth(auth)
-        )
-
-        if auth is not None:
-            return auth
-
-        username, password = request.url.username, request.url.password
-        if username or password:
-            return BasicAuth(username=username, password=password)
-
-        return Auth()
-
-    def _build_redirect_request(self, request: Request, response: Response) -> Request:
-        """
-        Given a request and a redirect response, return a new request that
-        should be used to effect the redirect.
-        """
-        method = self._redirect_method(request, response)
-        url = self._redirect_url(request, response)
-        headers = self._redirect_headers(request, url, method)
-        stream = self._redirect_stream(request, method)
-        cookies = Cookies(self.cookies)
-        return Request(
-            method=method,
-            url=url,
-            headers=headers,
-            cookies=cookies,
-            stream=stream,
-            extensions=request.extensions,
-        )
-
-    def _redirect_method(self, request: Request, response: Response) -> str:
-        """
-        When being redirected we may want to change the method of the request
-        based on certain specs or browser behavior.
-        """
-        method = request.method
-
-        # https://tools.ietf.org/html/rfc7231#section-6.4.4
-        if response.status_code == codes.SEE_OTHER and method != "HEAD":
-            method = "GET"
-
-        # Do what the browsers do, despite standards...
-        # Turn 302s into GETs.
-        if response.status_code == codes.FOUND and method != "HEAD":
-            method = "GET"
-
-        # If a POST is responded to with a 301, turn it into a GET.
-        # This bizarre behaviour is explained in 'requests' issue 1704.
-        if response.status_code == codes.MOVED_PERMANENTLY and method == "POST":
-            method = "GET"
-
-        return method
-
-    def _redirect_url(self, request: Request, response: Response) -> URL:
-        """
-        Return the URL for the redirect to follow.
-        """
-        location = response.headers["Location"]
-
-        try:
-            url = URL(location)
-        except InvalidURL as exc:
-            raise RemoteProtocolError(
-                f"Invalid URL in location header: {exc}.", request=request
-            ) from None
-
-        # Handle malformed 'Location' headers that are "absolute" form, have no host.
-        # See: https://github.com/encode/httpx/issues/771
-        if url.scheme and not url.host:
-            url = url.copy_with(host=request.url.host)
-
-        # Facilitate relative 'Location' headers, as allowed by RFC 7231.
-        # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
-        if url.is_relative_url:
-            url = request.url.join(url)
-
-        # Attach previous fragment if needed (RFC 7231 7.1.2)
-        if request.url.fragment and not url.fragment:
-            url = url.copy_with(fragment=request.url.fragment)
-
-        return url
-
-    def _redirect_headers(self, request: Request, url: URL, method: str) -> Headers:
-        """
-        Return the headers that should be used for the redirect request.
-        """
-        headers = Headers(request.headers)
-
-        if not same_origin(url, request.url):
-            if not is_https_redirect(request.url, url):
-                # Strip Authorization headers when responses are redirected
-                # away from the origin. (Except for direct HTTP to HTTPS redirects.)
-                headers.pop("Authorization", None)
-
-            # Update the Host header.
-            headers["Host"] = url.netloc.decode("ascii")
-
-        if method != request.method and method == "GET":
-            # If we've switch to a 'GET' request, then strip any headers which
-            # are only relevant to the request body.
-            headers.pop("Content-Length", None)
-            headers.pop("Transfer-Encoding", None)
-
-        # We should use the client cookie store to determine any cookie header,
-        # rather than whatever was on the original outgoing request.
-        headers.pop("Cookie", None)
-
-        return headers
-
-    def _redirect_stream(
-        self, request: Request, method: str
-    ) -> typing.Optional[typing.Union[SyncByteStream, AsyncByteStream]]:
-        """
-        Return the body that should be used for the redirect request.
-        """
-        if method != request.method and method == "GET":
-            return None
-
-        return request.stream
-
-
-class Client(BaseClient):
-    """
-    An HTTP client, with connection pooling, HTTP/2, redirects, cookie persistence, etc.
-
-    It can be shared between threads.
-
-    Usage:
-
-    ```python
-    >>> client = httpx.Client()
-    >>> response = client.get('https://example.org')
-    ```
-
-    **Parameters:**
-
-    * **auth** - *(optional)* An authentication class to use when sending
-    requests.
-    * **params** - *(optional)* Query parameters to include in request URLs, as
-    a string, dictionary, or sequence of two-tuples.
-    * **headers** - *(optional)* Dictionary of HTTP headers to include when
-    sending requests.
-    * **cookies** - *(optional)* Dictionary of Cookie items to include when
-    sending requests.
-    * **persistent_cookies** - *(optional) A boolean indicating if cookies should
-    persist. Defaults to `False`.
-    * **verify** - *(optional)* SSL certificates (a.k.a CA bundle) used to
-    verify the identity of requested hosts. Either `True` (default CA bundle),
-    a path to an SSL certificate file, an `ssl.SSLContext`, or `False`
-    (which will disable verification).
-    * **cert** - *(optional)* An SSL certificate used by the requested host
-    to authenticate the client. Either a path to an SSL certificate file, or
-    two-tuple of (certificate file, key file), or a three-tuple of (certificate
-    file, key file, password).
-    * **proxy** - *(optional)* A proxy URL where all the traffic should be routed.
-    * **proxies** - *(optional)* A dictionary mapping proxy keys to proxy
-    URLs.
-    * **timeout** - *(optional)* The timeout configuration to use when sending
-    requests.
-    * **limits** - *(optional)* The limits configuration to use.
-    * **max_redirects** - *(optional)* The maximum number of redirect responses
-    that should be followed.
-    * **base_url** - *(optional)* A URL to use as the base when building
-    request URLs.
-    * **transport** - *(optional)* A transport class to use for sending requests
-    over the network.
-    * **app** - *(optional)* An WSGI application to send requests to,
-    rather than sending actual network requests.
-    * **trust_env** - *(optional)* Enables or disables usage of environment
-    variables for configuration.
-    * **default_encoding** - *(optional)* The default encoding to use for decoding
-    response text, if no charset information is included in a response Content-Type
-    header. Set to a callable for automatic character set detection. Default: "utf-8".
-    """
-
-    def __init__(
-        self,
-        *,
-        auth: typing.Optional[AuthTypes] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        persistent_cookies: bool = False,
-        verify: VerifyTypes = True,
-        cert: typing.Optional[CertTypes] = None,
-        http1: bool = True,
-        http2: bool = False,
-        proxy: typing.Optional[ProxyTypes] = None,
-        proxies: typing.Optional[ProxiesTypes] = None,
-        mounts: typing.Optional[
-            typing.Mapping[str, typing.Optional[BaseTransport]]
-        ] = None,
-        timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
-        follow_redirects: bool = False,
-        limits: Limits = DEFAULT_LIMITS,
-        max_redirects: int = DEFAULT_MAX_REDIRECTS,
-        event_hooks: typing.Optional[
-            typing.Mapping[str, typing.List[EventHook]]
-        ] = None,
-        base_url: URLTypes = "",
-        transport: typing.Optional[BaseTransport] = None,
-        app: typing.Optional[typing.Callable[..., typing.Any]] = None,
-        trust_env: bool = True,
-        default_encoding: typing.Union[str, typing.Callable[[bytes], str]] = "utf-8",
-    ) -> None:
-        super().__init__(
-            auth=auth,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            persistent_cookies=persistent_cookies,
-            timeout=timeout,
-            follow_redirects=follow_redirects,
-            max_redirects=max_redirects,
-            event_hooks=event_hooks,
-            base_url=base_url,
-            trust_env=trust_env,
-            default_encoding=default_encoding,
-        )
-
-        if http2:
-            try:
-                import h2  # noqa
-            except ImportError:  # pragma: no cover
-                raise ImportError(
-                    "Using http2=True, but the 'h2' package is not installed. "
-                    "Make sure to install httpx using `pip install httpx[http2]`."
-                ) from None
-
-        if proxies:
-            message = (
-                "The 'proxies' argument is now deprecated."
-                " Use 'proxy' or 'mounts' instead."
-            )
-            warnings.warn(message, DeprecationWarning)
-            if proxy:
-                raise RuntimeError("Use either `proxy` or 'proxies', not both.")
-
-        allow_env_proxies = trust_env and app is None and transport is None
-        proxy_map = self._get_proxy_map(proxies or proxy, allow_env_proxies)
-
-        self._transport = self._init_transport(
-            verify=verify,
-            cert=cert,
-            http1=http1,
-            http2=http2,
-            limits=limits,
-            transport=transport,
-            app=app,
-            trust_env=trust_env,
-        )
-        self._mounts: typing.Dict[URLPattern, typing.Optional[BaseTransport]] = {
-            URLPattern(key): None
-            if proxy is None
-            else self._init_proxy_transport(
-                proxy,
-                verify=verify,
-                cert=cert,
-                http1=http1,
-                http2=http2,
-                limits=limits,
-                trust_env=trust_env,
-            )
-            for key, proxy in proxy_map.items()
-        }
-        if mounts is not None:
-            self._mounts.update(
-                {URLPattern(key): transport for key, transport in mounts.items()}
-            )
-
-        self._mounts = dict(sorted(self._mounts.items()))
-
-    def _init_transport(
-        self,
-        verify: VerifyTypes = True,
-        cert: typing.Optional[CertTypes] = None,
-        http1: bool = True,
-        http2: bool = False,
-        limits: Limits = DEFAULT_LIMITS,
-        transport: typing.Optional[BaseTransport] = None,
-        app: typing.Optional[typing.Callable[..., typing.Any]] = None,
-        trust_env: bool = True,
-    ) -> BaseTransport:
-        if transport is not None:
-            return transport
-
-        if app is not None:
-            return WSGITransport(app=app)
-
-        return HTTPTransport(
-            verify=verify,
-            cert=cert,
-            http1=http1,
-            http2=http2,
-            limits=limits,
-            trust_env=trust_env,
-        )
-
-    def _init_proxy_transport(
-        self,
-        proxy: Proxy,
-        verify: VerifyTypes = True,
-        cert: typing.Optional[CertTypes] = None,
-        http1: bool = True,
-        http2: bool = False,
-        limits: Limits = DEFAULT_LIMITS,
-        trust_env: bool = True,
-    ) -> BaseTransport:
-        return HTTPTransport(
-            verify=verify,
-            cert=cert,
-            http1=http1,
-            http2=http2,
-            limits=limits,
-            trust_env=trust_env,
-            proxy=proxy,
-        )
-
-    def _transport_for_url(self, url: URL) -> BaseTransport:
-        """
-        Returns the transport instance that should be used for a given URL.
-        This will either be the standard connection pool, or a proxy.
-        """
-        for pattern, transport in self._mounts.items():
-            if pattern.matches(url):
-                return self._transport if transport is None else transport
-
-        return self._transport
-
-    def request(
-        self,
-        method: str,
-        url: URLTypes,
-        *,
-        content: typing.Optional[RequestContent] = None,
-        data: typing.Optional[RequestData] = None,
-        files: typing.Optional[RequestFiles] = None,
-        json: typing.Optional[typing.Any] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault, None] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Build and send a request.
-
-        Equivalent to:
-
-        ```python
-        request = client.build_request(...)
-        response = client.send(request, ...)
-        ```
-
-        See `Client.build_request()`, `Client.send()` and
-        [Merging of configuration][0] for how the various parameters
-        are merged with client-level configuration.
-
-        [0]: /advanced/#merging-of-configuration
-        """
-        if cookies is not None:
-            message = (
-                "Setting per-request cookies=<...> is being deprecated, because "
-                "the expected behaviour on cookie persistence is ambiguous. Set "
-                "cookies directly on the client instance instead."
-            )
-            warnings.warn(message, DeprecationWarning)
-
-        request = self.build_request(
-            method=method,
-            url=url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            timeout=timeout,
-            extensions=extensions,
-        )
-        return self.send(request, auth=auth, follow_redirects=follow_redirects)
-
-    @contextmanager
-    def stream(
-        self,
-        method: str,
-        url: URLTypes,
-        *,
-        content: typing.Optional[RequestContent] = None,
-        data: typing.Optional[RequestData] = None,
-        files: typing.Optional[RequestFiles] = None,
-        json: typing.Optional[typing.Any] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault, None] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> typing.Iterator[Response]:
-        """
-        Alternative to `httpx.request()` that streams the response body
-        instead of loading it into memory at once.
-
-        **Parameters**: See `httpx.request`.
-
-        See also: [Streaming Responses][0]
-
-        [0]: /quickstart#streaming-responses
-        """
-        request = self.build_request(
-            method=method,
-            url=url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            timeout=timeout,
-            extensions=extensions,
-        )
-        response = self.send(
-            request=request,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            stream=True,
-        )
-        try:
-            yield response
-        finally:
-            response.close()
-
-    def send(
-        self,
-        request: Request,
-        *,
-        stream: bool = False,
-        auth: typing.Union[AuthTypes, UseClientDefault, None] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-    ) -> Response:
-        """
-        Send a request.
-
-        The request is sent as-is, unmodified.
-
-        Typically you'll want to build one with `Client.build_request()`
-        so that any client-level configuration is merged into the request,
-        but passing an explicit `httpx.Request()` is supported as well.
-
-        See also: [Request instances][0]
-
-        [0]: /advanced/#request-instances
-        """
-        if self._state == ClientState.CLOSED:
-            raise RuntimeError("Cannot send a request, as the client has been closed.")
-
-        self._state = ClientState.OPENED
-        follow_redirects = (
-            self.follow_redirects
-            if isinstance(follow_redirects, UseClientDefault)
-            else follow_redirects
-        )
-
-        auth = self._build_request_auth(request, auth)
-
-        response = self._send_handling_auth(
-            request,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            history=[],
-        )
-        try:
-            if not stream:
-                response.read()
-
-            return response
-
-        except BaseException as exc:
-            response.close()
-            raise exc
-
-    def _send_handling_auth(
-        self,
-        request: Request,
-        auth: Auth,
-        follow_redirects: bool,
-        history: typing.List[Response],
-    ) -> Response:
-        auth_flow = auth.sync_auth_flow(request)
-        try:
-            request = next(auth_flow)
-
-            while True:
-                response = self._send_handling_redirects(
-                    request,
-                    follow_redirects=follow_redirects,
-                    history=history,
-                )
-                try:
-                    try:
-                        next_request = auth_flow.send(response)
-                    except StopIteration:
-                        return response
-
-                    response.history = list(history)
-                    response.read()
-                    request = next_request
-                    history.append(response)
-
-                except BaseException as exc:
-                    response.close()
-                    raise exc
-        finally:
-            auth_flow.close()
-
-    def _send_handling_redirects(
-        self,
-        request: Request,
-        follow_redirects: bool,
-        history: typing.List[Response],
-    ) -> Response:
-        while True:
-            if len(history) > self.max_redirects:
-                raise TooManyRedirects(
-                    "Exceeded maximum allowed redirects.", request=request
-                )
-
-            for hook in self._event_hooks["request"]:
-                hook(request)
-
-            response = self._send_single_request(request)
-            try:
-                for hook in self._event_hooks["response"]:
-                    hook(response)
-                response.history = list(history)
-
-                if not response.has_redirect_location:
-                    return response
-
-                request = self._build_redirect_request(request, response)
-                history = history + [response]
-
-                if follow_redirects:
-                    response.read()
-                else:
-                    response.next_request = request
-                    return response
-
-            except BaseException as exc:
-                response.close()
-                raise exc
-
-    def _send_single_request(self, request: Request) -> Response:
-        """
-        Sends a single request, without handling any redirections.
-        """
-        transport = self._transport_for_url(request.url)
-        timer = Timer()
-        timer.sync_start()
-
-        if not isinstance(request.stream, SyncByteStream):
-            raise RuntimeError(
-                "Attempted to send an async request with a sync Client instance."
-            )
-
-        with request_context(request=request):
-            response = transport.handle_request(request)
-
-        assert isinstance(response.stream, SyncByteStream)
-
-        response.request = request
-        response.stream = BoundSyncStream(
-            response.stream, response=response, timer=timer
-        )
-        if self._persistent_cookies:
-            self.cookies.extract_cookies(response)
-        response.default_encoding = self._default_encoding
-
-        logger.info(
-            'HTTP Request: %s %s "%s %d %s"',
-            request.method,
-            request.url,
-            response.http_version,
-            response.status_code,
-            response.reason_phrase,
-        )
-
-        return response
-
-    def get(
-        self,
-        url: URLTypes,
-        *,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send a `GET` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return self.request(
-            "GET",
-            url,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    def options(
-        self,
-        url: URLTypes,
-        *,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send an `OPTIONS` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return self.request(
-            "OPTIONS",
-            url,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    def head(
-        self,
-        url: URLTypes,
-        *,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send a `HEAD` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return self.request(
-            "HEAD",
-            url,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    def post(
-        self,
-        url: URLTypes,
-        *,
-        content: typing.Optional[RequestContent] = None,
-        data: typing.Optional[RequestData] = None,
-        files: typing.Optional[RequestFiles] = None,
-        json: typing.Optional[typing.Any] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send a `POST` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return self.request(
-            "POST",
-            url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    def put(
-        self,
-        url: URLTypes,
-        *,
-        content: typing.Optional[RequestContent] = None,
-        data: typing.Optional[RequestData] = None,
-        files: typing.Optional[RequestFiles] = None,
-        json: typing.Optional[typing.Any] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send a `PUT` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return self.request(
-            "PUT",
-            url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    def patch(
-        self,
-        url: URLTypes,
-        *,
-        content: typing.Optional[RequestContent] = None,
-        data: typing.Optional[RequestData] = None,
-        files: typing.Optional[RequestFiles] = None,
-        json: typing.Optional[typing.Any] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send a `PATCH` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return self.request(
-            "PATCH",
-            url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    def delete(
-        self,
-        url: URLTypes,
-        *,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send a `DELETE` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return self.request(
-            "DELETE",
-            url,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    def close(self) -> None:
-        """
-        Close transport and proxies.
-        """
-        if self._state != ClientState.CLOSED:
-            self._state = ClientState.CLOSED
-
-            self._transport.close()
-            for transport in self._mounts.values():
-                if transport is not None:
-                    transport.close()
-
-    def __enter__(self: T) -> T:
+    def __enter__(self) -> "Client":
         if self._state != ClientState.UNOPENED:
             msg = {
                 ClientState.OPENED: "Cannot open a client instance more than once.",
@@ -1293,10 +378,17 @@ class Client(BaseClient):
 
         self._state = ClientState.OPENED
 
-        self._transport.__enter__()
-        for transport in self._mounts.values():
-            if transport is not None:
-                transport.__enter__()
+        if self._transport is None:
+            self._transport = self._get_transport()
+
+        if self._transport is not None:
+            self._transport.__enter__()
+
+        for proxy in self._mounts.values():
+            if proxy is not None:
+                if proxy.transport is not None:
+                    proxy.transport.__enter__()
+
         return self
 
     def __exit__(
@@ -1307,715 +399,12 @@ class Client(BaseClient):
     ) -> None:
         self._state = ClientState.CLOSED
 
-        self._transport.__exit__(exc_type, exc_value, traceback)
-        for transport in self._mounts.values():
-            if transport is not None:
-                transport.__exit__(exc_type, exc_value, traceback)
-
-
-class AsyncClient(BaseClient):
-    """
-    An asynchronous HTTP client, with connection pooling, HTTP/2, redirects,
-    cookie persistence, etc.
-
-    Usage:
-
-    ```python
-    >>> async with httpx.AsyncClient() as client:
-    >>>     response = await client.get('https://example.org')
-    ```
-
-    **Parameters:**
-
-    * **auth** - *(optional)* An authentication class to use when sending
-    requests.
-    * **params** - *(optional)* Query parameters to include in request URLs, as
-    a string, dictionary, or sequence of two-tuples.
-    * **headers** - *(optional)* Dictionary of HTTP headers to include when
-    sending requests.
-    * **cookies** - *(optional)* Dictionary of Cookie items to include when
-    sending requests.
-    * **persistent_cookies** - *(optional) A boolean indicating if cookies should
-    persist. Defaults to `False`.
-    * **verify** - *(optional)* SSL certificates (a.k.a CA bundle) used to
-    verify the identity of requested hosts. Either `True` (default CA bundle),
-    a path to an SSL certificate file, an `ssl.SSLContext`, or `False`
-    (which will disable verification).
-    * **cert** - *(optional)* An SSL certificate used by the requested host
-    to authenticate the client. Either a path to an SSL certificate file, or
-    two-tuple of (certificate file, key file), or a three-tuple of (certificate
-    file, key file, password).
-    * **http2** - *(optional)* A boolean indicating if HTTP/2 support should be
-    enabled. Defaults to `False`.
-    * **proxy** - *(optional)* A proxy URL where all the traffic should be routed.
-    * **proxies** - *(optional)* A dictionary mapping HTTP protocols to proxy
-    URLs.
-    * **timeout** - *(optional)* The timeout configuration to use when sending
-    requests.
-    * **limits** - *(optional)* The limits configuration to use.
-    * **max_redirects** - *(optional)* The maximum number of redirect responses
-    that should be followed.
-    * **base_url** - *(optional)* A URL to use as the base when building
-    request URLs.
-    * **transport** - *(optional)* A transport class to use for sending requests
-    over the network.
-    * **app** - *(optional)* An ASGI application to send requests to,
-    rather than sending actual network requests.
-    * **trust_env** - *(optional)* Enables or disables usage of environment
-    variables for configuration.
-    * **default_encoding** - *(optional)* The default encoding to use for decoding
-    response text, if no charset information is included in a response Content-Type
-    header. Set to a callable for automatic character set detection. Default: "utf-8".
-    """
-
-    def __init__(
-        self,
-        *,
-        auth: typing.Optional[AuthTypes] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        persistent_cookies: bool = False,
-        verify: VerifyTypes = True,
-        cert: typing.Optional[CertTypes] = None,
-        http1: bool = True,
-        http2: bool = False,
-        proxy: typing.Optional[ProxyTypes] = None,
-        proxies: typing.Optional[ProxiesTypes] = None,
-        mounts: typing.Optional[
-            typing.Mapping[str, typing.Optional[AsyncBaseTransport]]
-        ] = None,
-        timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
-        follow_redirects: bool = False,
-        limits: Limits = DEFAULT_LIMITS,
-        max_redirects: int = DEFAULT_MAX_REDIRECTS,
-        event_hooks: typing.Optional[
-            typing.Mapping[str, typing.List[typing.Callable[..., typing.Any]]]
-        ] = None,
-        base_url: URLTypes = "",
-        transport: typing.Optional[AsyncBaseTransport] = None,
-        app: typing.Optional[typing.Callable[..., typing.Any]] = None,
-        trust_env: bool = True,
-        default_encoding: typing.Union[str, typing.Callable[[bytes], str]] = "utf-8",
-    ) -> None:
-        super().__init__(
-            auth=auth,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            persistent_cookies=persistent_cookies,
-            timeout=timeout,
-            follow_redirects=follow_redirects,
-            max_redirects=max_redirects,
-            event_hooks=event_hooks,
-            base_url=base_url,
-            trust_env=trust_env,
-            default_encoding=default_encoding,
-        )
-
-        if http2:
-            try:
-                import h2  # noqa
-            except ImportError:  # pragma: no cover
-                raise ImportError(
-                    "Using http2=True, but the 'h2' package is not installed. "
-                    "Make sure to install httpx using `pip install httpx[http2]`."
-                ) from None
-
-        if proxies:
-            message = (
-                "The 'proxies' argument is now deprecated."
-                " Use 'proxy' or 'mounts' instead."
-            )
-            warnings.warn(message, DeprecationWarning)
-            if proxy:
-                raise RuntimeError("Use either `proxy` or 'proxies', not both.")
-
-        allow_env_proxies = trust_env and app is None and transport is None
-        proxy_map = self._get_proxy_map(proxies or proxy, allow_env_proxies)
-
-        self._transport = self._init_transport(
-            verify=verify,
-            cert=cert,
-            http1=http1,
-            http2=http2,
-            limits=limits,
-            transport=transport,
-            app=app,
-            trust_env=trust_env,
-        )
-
-        self._mounts: typing.Dict[URLPattern, typing.Optional[AsyncBaseTransport]] = {
-            URLPattern(key): None
-            if proxy is None
-            else self._init_proxy_transport(
-                proxy,
-                verify=verify,
-                cert=cert,
-                http1=http1,
-                http2=http2,
-                limits=limits,
-                trust_env=trust_env,
-            )
-            for key, proxy in proxy_map.items()
-        }
-        if mounts is not None:
-            self._mounts.update(
-                {URLPattern(key): transport for key, transport in mounts.items()}
-            )
-        self._mounts = dict(sorted(self._mounts.items()))
-
-    def _init_transport(
-        self,
-        verify: VerifyTypes = True,
-        cert: typing.Optional[CertTypes] = None,
-        http1: bool = True,
-        http2: bool = False,
-        limits: Limits = DEFAULT_LIMITS,
-        transport: typing.Optional[AsyncBaseTransport] = None,
-        app: typing.Optional[typing.Callable[..., typing.Any]] = None,
-        trust_env: bool = True,
-    ) -> AsyncBaseTransport:
-        if transport is not None:
-            return transport
-
-        if app is not None:
-            return ASGITransport(app=app)
-
-        return AsyncHTTPTransport(
-            verify=verify,
-            cert=cert,
-            http1=http1,
-            http2=http2,
-            limits=limits,
-            trust_env=trust_env,
-        )
-
-    def _init_proxy_transport(
-        self,
-        proxy: Proxy,
-        verify: VerifyTypes = True,
-        cert: typing.Optional[CertTypes] = None,
-        http1: bool = True,
-        http2: bool = False,
-        limits: Limits = DEFAULT_LIMITS,
-        trust_env: bool = True,
-    ) -> AsyncBaseTransport:
-        return AsyncHTTPTransport(
-            verify=verify,
-            cert=cert,
-            http2=http2,
-            limits=limits,
-            trust_env=trust_env,
-            proxy=proxy,
-        )
-
-    def _transport_for_url(self, url: URL) -> AsyncBaseTransport:
-        """
-        Returns the transport instance that should be used for a given URL.
-        This will either be the standard connection pool, or a proxy.
-        """
-        for pattern, transport in self._mounts.items():
-            if pattern.matches(url):
-                return self._transport if transport is None else transport
-
-        return self._transport
-
-    async def request(
-        self,
-        method: str,
-        url: URLTypes,
-        *,
-        content: typing.Optional[RequestContent] = None,
-        data: typing.Optional[RequestData] = None,
-        files: typing.Optional[RequestFiles] = None,
-        json: typing.Optional[typing.Any] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault, None] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Build and send a request.
-
-        Equivalent to:
-
-        ```python
-        request = client.build_request(...)
-        response = await client.send(request, ...)
-        ```
-
-        See `AsyncClient.build_request()`, `AsyncClient.send()`
-        and [Merging of configuration][0] for how the various parameters
-        are merged with client-level configuration.
-
-        [0]: /advanced/#merging-of-configuration
-        """
-        request = self.build_request(
-            method=method,
-            url=url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            timeout=timeout,
-            extensions=extensions,
-        )
-        return await self.send(request, auth=auth, follow_redirects=follow_redirects)
-
-    @asynccontextmanager
-    async def stream(
-        self,
-        method: str,
-        url: URLTypes,
-        *,
-        content: typing.Optional[RequestContent] = None,
-        data: typing.Optional[RequestData] = None,
-        files: typing.Optional[RequestFiles] = None,
-        json: typing.Optional[typing.Any] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> typing.AsyncIterator[Response]:
-        """
-        Alternative to `httpx.request()` that streams the response body
-        instead of loading it into memory at once.
-
-        **Parameters**: See `httpx.request`.
-
-        See also: [Streaming Responses][0]
-
-        [0]: /quickstart#streaming-responses
-        """
-        request = self.build_request(
-            method=method,
-            url=url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            timeout=timeout,
-            extensions=extensions,
-        )
-        response = await self.send(
-            request=request,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            stream=True,
-        )
-        try:
-            yield response
-        finally:
-            await response.aclose()
-
-    async def send(
-        self,
-        request: Request,
-        *,
-        stream: bool = False,
-        auth: typing.Union[AuthTypes, UseClientDefault, None] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-    ) -> Response:
-        """
-        Send a request.
-
-        The request is sent as-is, unmodified.
-
-        Typically you'll want to build one with `AsyncClient.build_request()`
-        so that any client-level configuration is merged into the request,
-        but passing an explicit `httpx.Request()` is supported as well.
-
-        See also: [Request instances][0]
-
-        [0]: /advanced/#request-instances
-        """
-        if self._state == ClientState.CLOSED:
-            raise RuntimeError("Cannot send a request, as the client has been closed.")
-
-        self._state = ClientState.OPENED
-        follow_redirects = (
-            self.follow_redirects
-            if isinstance(follow_redirects, UseClientDefault)
-            else follow_redirects
-        )
-
-        auth = self._build_request_auth(request, auth)
-
-        response = await self._send_handling_auth(
-            request,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            history=[],
-        )
-        try:
-            if not stream:
-                await response.aread()
-
-            return response
-
-        except BaseException as exc:  # pragma: no cover
-            await response.aclose()
-            raise exc
-
-    async def _send_handling_auth(
-        self,
-        request: Request,
-        auth: Auth,
-        follow_redirects: bool,
-        history: typing.List[Response],
-    ) -> Response:
-        auth_flow = auth.async_auth_flow(request)
-        try:
-            request = await auth_flow.__anext__()
-
-            while True:
-                response = await self._send_handling_redirects(
-                    request,
-                    follow_redirects=follow_redirects,
-                    history=history,
-                )
-                try:
-                    try:
-                        next_request = await auth_flow.asend(response)
-                    except StopAsyncIteration:
-                        return response
-
-                    response.history = list(history)
-                    await response.aread()
-                    request = next_request
-                    history.append(response)
-
-                except BaseException as exc:
-                    await response.aclose()
-                    raise exc
-        finally:
-            await auth_flow.aclose()
-
-    async def _send_handling_redirects(
-        self,
-        request: Request,
-        follow_redirects: bool,
-        history: typing.List[Response],
-    ) -> Response:
-        while True:
-            if len(history) > self.max_redirects:
-                raise TooManyRedirects(
-                    "Exceeded maximum allowed redirects.", request=request
-                )
-
-            for hook in self._event_hooks["request"]:
-                await hook(request)
-
-            response = await self._send_single_request(request)
-            try:
-                for hook in self._event_hooks["response"]:
-                    await hook(response)
-
-                response.history = list(history)
-
-                if not response.has_redirect_location:
-                    return response
-
-                request = self._build_redirect_request(request, response)
-                history = history + [response]
-
-                if follow_redirects:
-                    await response.aread()
-                else:
-                    response.next_request = request
-                    return response
-
-            except BaseException as exc:
-                await response.aclose()
-                raise exc
-
-    async def _send_single_request(self, request: Request) -> Response:
-        """
-        Sends a single request, without handling any redirections.
-        """
-        transport = self._transport_for_url(request.url)
-        timer = Timer()
-        await timer.async_start()
-
-        if not isinstance(request.stream, AsyncByteStream):
-            raise RuntimeError(
-                "Attempted to send an sync request with an AsyncClient instance."
-            )
-
-        with request_context(request=request):
-            response = await transport.handle_async_request(request)
-
-        assert isinstance(response.stream, AsyncByteStream)
-        response.request = request
-        response.stream = BoundAsyncStream(
-            response.stream, response=response, timer=timer
-        )
-        if self._persistent_cookies:
-            self.cookies.extract_cookies(response)
-        response.default_encoding = self._default_encoding
-
-        logger.info(
-            'HTTP Request: %s %s "%s %d %s"',
-            request.method,
-            request.url,
-            response.http_version,
-            response.status_code,
-            response.reason_phrase,
-        )
-
-        return response
-
-    async def get(
-        self,
-        url: URLTypes,
-        *,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault, None] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send a `GET` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return await self.request(
-            "GET",
-            url,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    async def options(
-        self,
-        url: URLTypes,
-        *,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send an `OPTIONS` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return await self.request(
-            "OPTIONS",
-            url,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    async def head(
-        self,
-        url: URLTypes,
-        *,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send a `HEAD` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return await self.request(
-            "HEAD",
-            url,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    async def post(
-        self,
-        url: URLTypes,
-        *,
-        content: typing.Optional[RequestContent] = None,
-        data: typing.Optional[RequestData] = None,
-        files: typing.Optional[RequestFiles] = None,
-        json: typing.Optional[typing.Any] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send a `POST` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return await self.request(
-            "POST",
-            url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    async def put(
-        self,
-        url: URLTypes,
-        *,
-        content: typing.Optional[RequestContent] = None,
-        data: typing.Optional[RequestData] = None,
-        files: typing.Optional[RequestFiles] = None,
-        json: typing.Optional[typing.Any] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send a `PUT` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return await self.request(
-            "PUT",
-            url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    async def patch(
-        self,
-        url: URLTypes,
-        *,
-        content: typing.Optional[RequestContent] = None,
-        data: typing.Optional[RequestData] = None,
-        files: typing.Optional[RequestFiles] = None,
-        json: typing.Optional[typing.Any] = None,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send a `PATCH` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return await self.request(
-            "PATCH",
-            url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    async def delete(
-        self,
-        url: URLTypes,
-        *,
-        params: typing.Optional[QueryParamTypes] = None,
-        headers: typing.Optional[HeaderTypes] = None,
-        cookies: typing.Optional[CookieTypes] = None,
-        auth: typing.Union[AuthTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        follow_redirects: typing.Union[bool, UseClientDefault] = USE_CLIENT_DEFAULT,
-        timeout: typing.Union[TimeoutTypes, UseClientDefault] = USE_CLIENT_DEFAULT,
-        extensions: typing.Optional[RequestExtensions] = None,
-    ) -> Response:
-        """
-        Send a `DELETE` request.
-
-        **Parameters**: See `httpx.request`.
-        """
-        return await self.request(
-            "DELETE",
-            url,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-
-    async def aclose(self) -> None:
-        """
-        Close transport and proxies.
-        """
-        if self._state != ClientState.CLOSED:
-            self._state = ClientState.CLOSED
-
-            await self._transport.aclose()
-            for proxy in self._mounts.values():
-                if proxy is not None:
-                    await proxy.aclose()
+        if self._transport is not None:
+            self._transport.__exit__(exc_type, exc_value, traceback)
+
+        for proxy in self._mounts.values():
+            if proxy is not None and proxy.transport is not None:
+                proxy.transport.__exit__(exc_type, exc_value, traceback)
 
     async def __aenter__(self: U) -> U:
         if self._state != ClientState.UNOPENED:
@@ -2029,10 +418,17 @@ class AsyncClient(BaseClient):
 
         self._state = ClientState.OPENED
 
-        await self._transport.__aenter__()
+        if self._transport is None:
+            self._transport = await self._aget_transport()
+
+        if self._transport is not None:
+            await self._transport.__aenter__()
+
         for proxy in self._mounts.values():
             if proxy is not None:
-                await proxy.__aenter__()
+                if proxy.transport is not None:
+                    await proxy.transport.__aenter__()
+
         return self
 
     async def __aexit__(
@@ -2043,7 +439,691 @@ class AsyncClient(BaseClient):
     ) -> None:
         self._state = ClientState.CLOSED
 
-        await self._transport.__aexit__(exc_type, exc_value, traceback)
+        if self._transport is not None:
+            await self._transport.__aexit__(exc_type, exc_value, traceback)
+
         for proxy in self._mounts.values():
-            if proxy is not None:
-                await proxy.__aexit__(exc_type, exc_value, traceback)
+            if proxy is not None and proxy.transport is not None:
+                await proxy.transport.__aexit__(exc_type, exc_value, traceback)
+
+    def _get_transport(self) -> BaseTransport:
+        if self._transport is not None:
+            return self._transport
+
+        if self._proxy is not None:
+            return self._get_proxy_transport()
+
+        return self._get_default_transport()
+
+    async def _aget_transport(self) -> AsyncBaseTransport:
+        if self._transport is not None:
+            return self._transport
+
+        if self._proxy is not None:
+            return await self._aget_proxy_transport()
+
+        return await self._aget_default_transport()
+
+    def _get_default_transport(self) -> HTTPTransport:
+        return HTTPTransport(
+            limits=self._limits,
+            follow_redirects=self._follow_redirects,
+            auth=self._auth,
+            proxy=self._proxy,
+            timeout=self._timeout,
+            verify=self._verify,
+            cert=self._cert,
+            http2=self._http2,
+            http2_prior_knowledge=self._http2_prior_knowledge,
+            dispatch=self._dispatch,
+            event_hooks=self._event_hooks,
+            extensions=self._extensions,
+        )
+
+    async def _aget_default_transport(self) -> AsyncHTTPTransport:
+        return AsyncHTTPTransport(
+            limits=self._limits,
+            follow_redirects=self._follow_redirects,
+            auth=self._auth,
+            proxy=self._proxy,
+            timeout=self._timeout,
+            verify=self._verify,
+            cert=self._cert,
+            http2=self._http2,
+            http2_prior_knowledge=self._http2_prior_knowledge,
+            dispatch=self._dispatch,
+            event_hooks=self._event_hooks,
+            extensions=self._extensions,
+        )
+
+    def _get_proxy_transport(self) -> ASGITransport:
+        return ASGITransport(
+            limits=self._limits,
+            auth=self._auth,
+            proxy=self._proxy,
+            timeout=self._timeout,
+            verify=self._verify,
+            cert=self._cert,
+            http2=self._http2,
+            http2_prior_knowledge=self._http2_prior_knowledge,
+            dispatch=self._dispatch,
+            event_hooks=self._event_hooks,
+            extensions=self._extensions,
+        )
+
+    async def _aget_proxy_transport(self) -> ASGITransport:
+        return ASGITransport(
+            limits=self._limits,
+            auth=self._auth,
+            proxy=self._proxy,
+            timeout=self._timeout,
+            verify=self._verify,
+            cert=self._cert,
+            http2=self._http2,
+            http2_prior_knowledge=self._http2_prior_knowledge,
+            dispatch=self._dispatch,
+            event_hooks=self._event_hooks,
+            extensions=self._extensions,
+        )
+
+    def _get_transport_for_url(self, url: URL) -> BaseTransport:
+        if self._proxy is not None:
+            return self._get_proxy_transport()
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]
+
+        return self._get_default_transport()
+
+    async def _aget_transport_for_url(self, url: URL) -> AsyncBaseTransport:
+        if self._proxy is not None:
+            return await self._aget_proxy_transport()
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]
+
+        return await self._aget_default_transport()
+
+    def _set_transport_for_url(self, url: URL, transport: BaseTransport) -> None:
+        if self._mounts.get(url.scheme) is not None:
+            raise RuntimeError(
+                f"Cannot override the transport for the '{url.scheme}' URL scheme."
+            )
+
+        self._mounts[url.scheme] = transport
+
+    async def _aset_transport_for_url(
+        self, url: URL, transport: AsyncBaseTransport
+    ) -> None:
+        if self._mounts.get(url.scheme) is not None:
+            raise RuntimeError(
+                f"Cannot override the transport for the '{url.scheme}' URL scheme."
+            )
+
+        self._mounts[url.scheme] = transport
+
+    def _get_auth_for_url(self, url: URL) -> Auth:
+        if self._auth is not None:
+            return self._auth
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]._auth
+
+        return None
+
+    async def _aget_auth_for_url(self, url: URL) -> Auth:
+        if self._auth is not None:
+            return self._auth
+
+        if self._mounts.get(url.scheme) is not None:
+            return await self._mounts[url.scheme]._aget_auth_for_url(url)
+
+        return None
+
+    def _set_auth_for_url(self, url: URL, auth: Auth) -> None:
+        if self._auth is not None:
+            raise RuntimeError(
+                "Cannot override the auth for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            self._mounts[url.scheme]._set_auth_for_url(url, auth)
+            return
+
+        self._auth = auth
+
+    async def _aset_auth_for_url(self, url: URL, auth: Auth) -> None:
+        if self._auth is not None:
+            raise RuntimeError(
+                "Cannot override the auth for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            await self._mounts[url.scheme]._aset_auth_for_url(url, auth)
+            return
+
+        self._auth = auth
+
+    def _get_proxy_for_url(self, url: URL) -> Proxy:
+        if self._proxy is not None:
+            return self._proxy
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]._proxy
+
+        return None
+
+    async def _aget_proxy_for_url(self, url: URL) -> Proxy:
+        if self._proxy is not None:
+            return self._proxy
+
+        if self._mounts.get(url.scheme) is not None:
+            return await self._mounts[url.scheme]._aget_proxy_for_url(url)
+
+        return None
+
+    def _set_proxy_for_url(self, url: URL, proxy: Proxy) -> None:
+        if self._proxy is not None:
+            raise RuntimeError(
+                "Cannot override the proxy for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            self._mounts[url.scheme]._set_proxy_for_url(url, proxy)
+            return
+
+        self._proxy = proxy
+
+    async def _aset_proxy_for_url(self, url: URL, proxy: Proxy) -> None:
+        if self._proxy is not None:
+            raise RuntimeError(
+                "Cannot override the proxy for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            await self._mounts[url.scheme]._aset_proxy_for_url(url, proxy)
+            return
+
+        self._proxy = proxy
+
+    def _get_timeout_for_url(self, url: URL) -> Timeout:
+        if self._timeout is not None:
+            return self._timeout
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]._timeout
+
+        return None
+
+    async def _aget_timeout_for_url(self, url: URL) -> Timeout:
+        if self._timeout is not None:
+            return self._timeout
+
+        if self._mounts.get(url.scheme) is not None:
+            return await self._mounts[url.scheme]._aget_timeout_for_url(url)
+
+        return None
+
+    def _set_timeout_for_url(self, url: URL, timeout: Timeout) -> None:
+        if self._timeout is not None:
+            raise RuntimeError(
+                "Cannot override the timeout for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            self._mounts[url.scheme]._set_timeout_for_url(url, timeout)
+            return
+
+        self._timeout = timeout
+
+    async def _aset_timeout_for_url(self, url: URL, timeout: Timeout) -> None:
+        if self._timeout is not None:
+            raise RuntimeError(
+                "Cannot override the timeout for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            await self._mounts[url.scheme]._aset_timeout_for_url(url, timeout)
+            return
+
+        self._timeout = timeout
+
+    def _get_verify_for_url(self, url: URL) -> VerifyTypes:
+        if self._verify is not None:
+            return self._verify
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]._verify
+
+        return None
+
+    async def _aget_verify_for_url(self, url: URL) -> VerifyTypes:
+        if self._verify is not None:
+            return self._verify
+
+        if self._mounts.get(url.scheme) is not None:
+            return await self._mounts[url.scheme]._aget_verify_for_url(url)
+
+        return None
+
+    def _set_verify_for_url(self, url: URL, verify: VerifyTypes) -> None:
+        if self._verify is not None:
+            raise RuntimeError(
+                "Cannot override the verify value for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            self._mounts[url.scheme]._set_verify_for_url(url, verify)
+            return
+
+        self._verify = verify
+
+    async def _aset_verify_for_url(self, url: URL, verify: VerifyTypes) -> None:
+        if self._verify is not None:
+            raise RuntimeError(
+                "Cannot override the verify value for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            await self._mounts[url.scheme]._aset_verify_for_url(url, verify)
+            return
+
+        self._verify = verify
+
+    def _get_cert_for_url(self, url: URL) -> CertTypes:
+        if self._cert is not None:
+            return self._cert
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]._cert
+
+        return None
+
+    async def _aget_cert_for_url(self, url: URL) -> CertTypes:
+        if self._cert is not None:
+            return self._cert
+
+        if self._mounts.get(url.scheme) is not None:
+            return await self._mounts[url.scheme]._aget_cert_for_url(url)
+
+        return None
+
+    def _set_cert_for_url(self, url: URL, cert: CertTypes) -> None:
+        if self._cert is not None:
+            raise RuntimeError(
+                "Cannot override the cert value for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            self._mounts[url.scheme]._set_cert_for_url(url, cert)
+            return
+
+        self._cert = cert
+
+    async def _aset_cert_for_url(self, url: URL, cert: CertTypes) -> None:
+        if self._cert is not None:
+            raise RuntimeError(
+                "Cannot override the cert value for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            await self._mounts[url.scheme]._aset_cert_for_url(url, cert)
+            return
+
+        self._cert = cert
+
+    def _get_http2_for_url(self, url: URL) -> bool:
+        if self._http2 is not None:
+            return self._http2
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]._http2
+
+        return None
+
+    async def _aget_http2_for_url(self, url: URL) -> bool:
+        if self._http2 is not None:
+            return self._http2
+
+        if self._mounts.get(url.scheme) is not None:
+            return await self._mounts[url.scheme]._aget_http2_for_url(url)
+
+        return None
+
+    def _set_http2_for_url(self, url: URL, http2: bool) -> None:
+        if self._http2 is not None:
+            raise RuntimeError(
+                "Cannot override the http2 value for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            self._mounts[url.scheme]._set_http2_for_url(url, http2)
+            return
+
+        self._http2 = http2
+
+    async def _aset_http2_for_url(self, url: URL, http2: bool) -> None:
+        if self._http2 is not None:
+            raise RuntimeError(
+                "Cannot override the http2 value for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            await self._mounts[url.scheme]._aset_http2_for_url(url, http2)
+            return
+
+        self._http2 = http2
+
+    def _get_http2_prior_knowledge_for_url(self, url: URL) -> bool:
+        if self._http2_prior_knowledge is not None:
+            return self._http2_prior_knowledge
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]._http2_prior_knowledge
+
+        return None
+
+    async def _aget_http2_prior_knowledge_for_url(
+        self, url: URL
+    ) -> bool:
+        if self._http2_prior_knowledge is not None:
+            return self._http2_prior_knowledge
+
+        if self._mounts.get(url.scheme) is not None:
+            return await self._mounts[url.scheme]._aget_http2_prior_knowledge_for_url(
+                url
+            )
+
+        return None
+
+    def _set_http2_prior_knowledge_for_url(
+        self, url: URL, http2_prior_knowledge: bool
+    ) -> None:
+        if self._http2_prior_knowledge is not None:
+            raise RuntimeError(
+                "Cannot override the http2_prior_knowledge value for the "
+                "default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            self._mounts[url.scheme]._set_http2_prior_knowledge_for_url(
+                url, http2_prior_knowledge
+            )
+            return
+
+        self._http2_prior_knowledge = http2_prior_knowledge
+
+    async def _aset_http2_prior_knowledge_for_url(
+        self, url: URL, http2_prior_knowledge: bool
+    ) -> None:
+        if self._http2_prior_knowledge is not None:
+            raise RuntimeError(
+                "Cannot override the http2_prior_knowledge value for the "
+                "default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            await self._mounts[url.scheme]._aset_http2_prior_knowledge_for_url(
+                url, http2_prior_knowledge
+            )
+            return
+
+        self._http2_prior_knowledge = http2_prior_knowledge
+
+    def _get_max_redirects_for_url(self, url: URL) -> int:
+        if self._max_redirects is not None:
+            return self._max_redirects
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]._max_redirects
+
+        return None
+
+    async def _aget_max_redirects_for_url(self, url: URL) -> int:
+        if self._max_redirects is not None:
+            return self._max_redirects
+
+        if self._mounts.get(url.scheme) is not None:
+            return await self._mounts[url.scheme]._aget_max_redirects_for_url(url)
+
+        return None
+
+    def _set_max_redirects_for_url(self, url: URL, max_redirects: int) -> None:
+        if self._max_redirects is not None:
+            raise RuntimeError(
+                "Cannot override the max_redirects value for the "
+                "default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            self._mounts[url.scheme]._set_max_redirects_for_url(url, max_redirects)
+            return
+
+        self._max_redirects = max_redirects
+
+    async def _aset_max_redirects_for_url(
+        self, url: URL, max_redirects: int
+    ) -> None:
+        if self._max_redirects is not None:
+            raise RuntimeError(
+                "Cannot override the max_redirects value for the "
+                "default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            await self._mounts[url.scheme]._aset_max_redirects_for_url(url, max_redirects)
+            return
+
+        self._max_redirects = max_redirects
+
+    def _get_dispatch_for_url(self, url: URL) -> "Dispatch":
+        if self._dispatch is not None:
+            return self._dispatch
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]._dispatch
+
+        return None
+
+    async def _aget_dispatch_for_url(self, url: URL) -> "Dispatch":
+        if self._dispatch is not None:
+            return self._dispatch
+
+        if self._mounts.get(url.scheme) is not None:
+            return await self._mounts[url.scheme]._aget_dispatch_for_url(url)
+
+        return None
+
+    def _set_dispatch_for_url(self, url: URL, dispatch: "Dispatch") -> None:
+        if self._dispatch is not None:
+            raise RuntimeError(
+                "Cannot override the dispatch for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            self._mounts[url.scheme]._set_dispatch_for_url(url, dispatch)
+            return
+
+        self._dispatch = dispatch
+
+    async def _aset_dispatch_for_url(self, url: URL, dispatch: "Dispatch") -> None:
+        if self._dispatch is not None:
+            raise RuntimeError(
+                "Cannot override the dispatch for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            await self._mounts[url.scheme]._aset_dispatch_for_url(url, dispatch)
+            return
+
+        self._dispatch = dispatch
+
+    def _get_event_hooks_for_url(self, url: URL) -> EventHooks:
+        if self._event_hooks is not None:
+            return self._event_hooks
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]._event_hooks
+
+        return None
+
+    async def _aget_event_hooks_for_url(self, url: URL) -> EventHooks:
+        if self._event_hooks is not None:
+            return self._event_hooks
+
+        if self._mounts.get(url.scheme) is not None:
+            return await self._mounts[url.scheme]._aget_event_hooks_for_url(url)
+
+        return None
+
+    def _set_event_hooks_for_url(self, url: URL, event_hooks: EventHooks) -> None:
+        if self._event_hooks is not None:
+            raise RuntimeError(
+                "Cannot override the event_hooks for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            self._mounts[url.scheme]._set_event_hooks_for_url(url, event_hooks)
+            return
+
+        self._event_hooks = event_hooks
+
+    async def _aset_event_hooks_for_url(
+        self, url: URL, event_hooks: EventHooks
+    ) -> None:
+        if self._event_hooks is not None:
+            raise RuntimeError(
+                "Cannot override the event_hooks for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            await self._mounts[url.scheme]._aset_event_hooks_for_url(url, event_hooks)
+            return
+
+        self._event_hooks = event_hooks
+
+    def _get_extensions_for_url(self, url: URL) -> Extensions:
+        if self._extensions is not None:
+            return self._extensions
+
+        if self._mounts.get(url.scheme) is not None:
+            return self._mounts[url.scheme]._extensions
+
+        return None
+
+    async def _aget_extensions_for_url(self, url: URL) -> Extensions:
+        if self._extensions is not None:
+            return self._extensions
+
+        if self._mounts.get(url.scheme) is not None:
+            return await self._mounts[url.scheme]._aget_extensions_for_url(url)
+
+        return None
+
+    def _set_extensions_for_url(self, url: URL, extensions: Extensions) -> None:
+        if self._extensions is not None:
+            raise RuntimeError(
+                "Cannot override the extensions for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            self._mounts[url.scheme]._set_extensions_for_url(url, extensions)
+            return
+
+        self._extensions = extensions
+
+    async def _aset_extensions_for_url(
+        self, url: URL, extensions: Extensions
+    ) -> None:
+        if self._extensions is not None:
+            raise RuntimeError(
+                "Cannot override the extensions for the default URL scheme."
+            )
+
+        if self._mounts.get(url.scheme) is not None:
+            await self._mounts[url.scheme]._aset_extensions_for_url(url, extensions)
+            return
+
+        self._extensions = extensions
+
+    def _get_transport_for_request(self, request: Request) -> BaseTransport:
+        return self._get_transport_for_url(request.url)
+
+    async def _aget_transport_for_request(
+        self, request: Request
+    ) -> AsyncBaseTransport:
+        return await self._aget_transport_for_url(request.url)
+
+    def _set_transport_for_request(
+        self, request: Request, transport: BaseTransport
+    ) -> None:
+        self._set_transport_for_url(request.url, transport)
+
+    async def _aset_transport_for_request(
+        self, request: Request, transport: AsyncBaseTransport
+    ) -> None:
+        await self._aset_transport_for_url(request.url, transport)
+
+    def _get_auth_for_request(self, request: Request) -> Auth:
+        return self._get_auth_for_url(request.url)
+
+    async def _aget_auth_for_request(self, request: Request) -> Auth:
+        return await self._aget_auth_for_url(request.url)
+
+    def _set_auth_for_request(self, request: Request, auth: Auth) -> None:
+        self._set_auth_for_url(request.url, auth)
+
+    async def _aset_auth_for_request(self, request: Request, auth: Auth) -> None:
+        await self._aset_auth_for_url(request.url, auth)
+
+    def _get_proxy_for_request(self, request: Request) -> Proxy:
+        return self._get_proxy_for_url(request.url)
+
+    async def _aget_proxy_for_request(self, request: Request) -> Proxy:
+        return await self._aget_proxy_for_url(request.url)
+
+    def _set_proxy_for_request(self, request: Request, proxy: Proxy) -> None:
+        self._set_proxy_for_url(request.url, proxy)
+
+    async def _aset_proxy_for_request(self, request: Request, proxy: Proxy) -> None:
+        await self._aset_proxy_for_url(request.url, proxy)
+
+    def _get_timeout_for_request(self, request: Request) -> Timeout:
+        return self._get_timeout_for_url(request.url)
+
+    async def _aget_timeout_for_request(self, request: Request) -> Timeout:
+        return await self._aget_timeout_for_url(request.url)
+
+    def _set_timeout_for_request(self, request: Request, timeout: Timeout) -> None:
+        self._set_timeout_for_url(request.url, timeout)
+
+    async def _aset_timeout_for_request(
+        self, request: Request, timeout: Timeout
+    ) -> None:
+        await self._aset_timeout_for_url(request.url, timeout)
+
+    def _get_verify_for_request(self, request: Request) -> VerifyTypes:
+        return self._get_verify_for_url(request.url)
+
+    async def _aget_verify_for_request(self, request: Request) -> VerifyTypes:
+        return await self._aget_verify_for_url(request.url)
+
+    def _set_verify_for_request(self, request: Request, verify: VerifyTypes) -> None:
+        self._set_verify_for_url(request.url, verify)
+
+    async def _aset_verify_for_request(
+        self, request: Request, verify: VerifyTypes
+    ) -> None:
+        await self._aset_verify_for_url(request.url, verify)
+
+    def _get_cert_for_request(self, request: Request) -> CertTypes:
+        return self._get_cert_for_url(request.url)
+
+    async def _aget_cert_for_request(self, request: Request) -> CertTypes:
+        return await self._aget_cert_for_url(request.url)
+
+    def _set_cert_for_request(self, request: Request, cert: CertTypes) -> None:
+        self._set_cert_for_url(request.url, cert)
+
+    async def _aset_cert_for_request(self, request: Request, cert: CertTypes) -> None:
+        await self._
